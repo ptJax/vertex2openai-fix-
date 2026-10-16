@@ -85,7 +85,10 @@ http://localhost:8050
 | `GOOGLE_PROJECT_ID` | 否 | 空 | Cookie 直连模式的 Project ID（初始值，后续可在控制台更新）。 |
 | `EXPERIMENT_FLAGS` | 否 | 空 | 可选：batchGraphql 的 `experimentFlagsBinary`，一般无需设置。 |
 | `STATE_DIR` | 否 | `.` | `web_state.json` 的存放目录。用 Docker 时请指向挂载卷，否则重建容器会丢失全部设置与 Cookie。 |
+| `RESUMABLE_UPSTREAM_TIMEOUT_SECONDS` | 否 | `900` | 开启续传缓冲时，单轮上游生成的总时限（秒，含建流、等待及读取）。重连不重置；超时返回明确错误，之后可重新生成。 |
 | `ALLOW_DEFAULT_KEY` | 否 | 空 | 仅用于在公开托管环境（如 HF Space）临时放行默认 `API_KEY`，正常部署不要设置。 |
+
+本地续传修复的说明、验证方式，以及从自有 GitHub Fork 部署到 Render 的步骤，见[续传超时修复与 Render 部署](docs/resumable-timeout-render.md)。
 
 > 提示：`ROUNDROBIN`、`FAKE_STREAMING(_INTERVAL)`、`SAFETY_SCORE` 等环境变量仅作为**初始值**，运行时以控制台设置为准。
 

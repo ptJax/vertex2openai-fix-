@@ -16,6 +16,8 @@ class AppSettings(BaseSettings):
     # 仅在确有需要时使用；要钉住 location 请用控制台的
     # express_location（见 DEFAULT_SETTINGS）+「通道与凭证」里的 Project ID，不要动这个。
     VERTEX_BASE_URL: Optional[str] = None
+    # 单轮后台生成的总时限，重连不重置；单位为秒。
+    RESUMABLE_UPSTREAM_TIMEOUT_SECONDS: float = 900.0
 
     # Cookie direct mode settings (Recommended for cloud deployments like Render)
     GOOGLE_COOKIE: Optional[str] = None         # Google Cookie string
@@ -155,10 +157,11 @@ DEFAULT_SETTINGS = {
     # api_helpers.is_location_pin_failure —— 所以这个默认值不会把任何人变糟。
     "express_location": "global",
     # 弱网可靠传输（见 resumable.py）：服务端响应缓冲 + 序列号事件 + 断线重放/分片轮询。
-    # 上游读取由后台泵任务驱动，与前端连接解绑；Google 的回复总能完整落缓冲。
+    # 上游读取由后台泵任务驱动，与前端连接解绑，在总时限内持续落缓冲。
     "resumable_enabled": True,            # 总开关；关掉则回到原有直通行为
     "resumable_ttl_seconds": 1800,        # 已完成的缓冲保留时长（秒），超时清掉
     "resumable_max_streams": 200,         # 缓冲总数上限，超限淘汰最旧的已完成缓冲
+    "resumable_upstream_timeout_seconds": _settings.RESUMABLE_UPSTREAM_TIMEOUT_SECONDS,
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     "model_overrides": {},
