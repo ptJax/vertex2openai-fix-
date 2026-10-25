@@ -12,7 +12,7 @@
 --------------------------------------
 1. **响应落缓冲**：每个请求在服务端建一个缓冲区，上游产出的每个 SSE 帧按到达顺序
    追加进去并分配**单调递增的序列号 seq**。上游的读取由一个**后台任务**驱动，
-   与前端连接解耦——前端断开不会直接取消它，后台持续接收直到完成或超时。
+   已有有效产出后与前端连接解耦；首包前断连保留重连窗口，所有任务都有总时限。
 2. **稳定请求 ID**：缓冲区的 id 优先取客户端请求头（X-Request-Id / Idempotency-Key），
    否则由「API Key + 请求体」哈希而来，因此**同一请求重发即命中同一缓冲区**。
 3. **断线续传**：
@@ -50,6 +50,7 @@ from runtime_state import app_state
 DONE_FRAME = "data: [DONE]\n\n"
 HEARTBEAT_INTERVAL_SECONDS = 15.0
 WAIT_LOG_INTERVAL_SECONDS = 60.0
+CANCEL_GRACE_SECONDS = 1.5
 
 
 class ResumableTimeoutError(TimeoutError):
@@ -113,6 +114,61 @@ def compute_stream_id(headers: Any, api_key: str, fingerprint: str) -> Tuple[str
     return f"req-{digest}", "请求体指纹"
 
 
+def is_keepalive_frame(text: str) -> bool:
+    """注释及假流式保活不进入缓冲，也不占用续传序号。"""
+    text = (text or "").lstrip()
+    return not text or text.startswith(":") or '"chatcmpl-keepalive"' in text
+
+
+def is_error_frame(text: str) -> bool:
+    """识别标准错误帧及旧版 Cookie 通道的错误提示。"""
+    text = (text or "").strip()
+    if not text.startswith("data:"):
+        return False
+    try:
+        data = json.loads(text[len("data:"):].strip())
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if "error" in data and not data.get("choices"):
+        return True
+    for choice in data.get("choices") or []:
+        content = (choice.get("delta") or {}).get("content") or ""
+        if isinstance(content, str) and any(
+            tag in content for tag in ("[Studio 错误]", "[Studio 权限错误]", "[Studio 提示] 上游")
+        ):
+            return True
+    return False
+
+
+def is_real_output_frame(text: str) -> bool:
+    """只有正文、思考或工具调用才算有效产出，角色及保活帧不算。"""
+    text = (text or "").strip()
+    if not text.startswith("data:") or is_error_frame(text):
+        return False
+    try:
+        data = json.loads(text[len("data:"):].strip())
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return any(
+        any((choice.get("delta") or {}).get(key) for key in ("content", "reasoning_content", "tool_calls"))
+        for choice in data.get("choices") or []
+    )
+
+
+def make_keepalive_sse(model: str) -> str:
+    """假流式客户端的空数据保活，仅发送给当前读者。"""
+    data = {
+        "id": "chatcmpl-keepalive", "object": "chat.completion.chunk",
+        "created": int(time.time()), "model": model or "unknown",
+        "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}],
+    }
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
 class ResumableBuffer:
     """一次回复的服务端权威副本（有序、带序号、可多次读取）。"""
 
@@ -129,7 +185,10 @@ class ResumableBuffer:
         self.payload: Optional[dict] = None   # 非流式：完整 JSON 响应体
         self.status_code: int = 200
         self.fully_delivered = False          # 是否已有读者完整读到终止帧
+        self.has_model_output = False
         self.readers = 0
+        self._abandon_task: Optional[asyncio.Task] = None
+        self._reader_left_at: Optional[float] = None
         self._cond = asyncio.Condition()
         self._timeout_seconds = upstream_timeout_seconds()
         self._started_at = time.monotonic()
@@ -145,6 +204,25 @@ class ResumableBuffer:
     def remaining_timeout(self) -> float:
         """整个生成共用截止时间，不因续传或保活而延期。"""
         return max(0.0, self._deadline - time.monotonic())
+
+    def enter_reader(self) -> None:
+        self.readers += 1
+        self._reader_left_at = None
+        self._cancel_abandon_check()
+
+    def leave_reader(self) -> None:
+        self.readers = max(0, self.readers - 1)
+        if self.readers == 0:
+            self._reader_left_at = time.monotonic()
+            if not self.done and not self.has_model_output:
+                self._cancel_abandon_check()
+                self._abandon_task = asyncio.create_task(_cancel_if_abandoned(self))
+
+    def _cancel_abandon_check(self) -> None:
+        task = self._abandon_task
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        self._abandon_task = None
 
     def log_lifecycle(self, event: str, detail: str = "") -> None:
         """仅记录生命周期元数据，不输出凭据、请求体或模型回复。"""
@@ -190,6 +268,7 @@ class ResumableBuffer:
             self.finished_at = time.time()
             self._finished_monotonic = time.monotonic()
             self._cond.notify_all()
+        self._cancel_abandon_check()
         event = "上游超时" if code == 504 else "请求失败"
         self.log_lifecycle(event, f"HTTP {code}；错误类型={error_type}；缓冲已结束并唤醒等待者")
         task = self._pump_task
@@ -218,10 +297,13 @@ class ResumableBuffer:
 
     # ---------- 写入端（后台泵任务持有） ----------
 
-    async def append(self, frame: str) -> int:
+    async def append(self, frame: str, is_model_output: bool = False) -> int:
         async with self._cond:
             if self.done:
                 return -1
+            if is_model_output:
+                self.has_model_output = True
+                self._cancel_abandon_check()
             self.events.append(frame)
             self._last_event_at = time.monotonic()
             self._cond.notify_all()
@@ -241,6 +323,7 @@ class ResumableBuffer:
             self.finished_at = time.time()
             self._finished_monotonic = time.monotonic()
             self._cond.notify_all()
+        self._cancel_abandon_check()
         self.log_lifecycle("响应落缓冲", f"HTTP {self.status_code}；仅表示代理接收结束，不代表客户端已显示")
 
     # ---------- 读取端（可以有多个、可以中途离开再回来） ----------
@@ -279,7 +362,7 @@ class ResumableBuffer:
     async def iter_from(self, seq: int = 0) -> AsyncIterator[Tuple[int, str]]:
         """从 seq 开始跟随读取，直到本轮结束且读完所有事件。"""
         i = max(0, seq)
-        self.readers += 1
+        self.enter_reader()
         try:
             while True:
                 await self.expire_if_stalled()
@@ -297,7 +380,7 @@ class ResumableBuffer:
                 yield i, frame
                 i += 1
         finally:
-            self.readers = max(0, self.readers - 1)
+            self.leave_reader()
 
     def mark_delivered(self) -> None:
         """读者已把终止帧交付出去：下一次同指纹请求应视为新生成，而不是重放。"""
@@ -315,6 +398,7 @@ class ResumableBuffer:
             "next": len(self.events),
             "done": self.done,
             "fully_delivered": self.fully_delivered,
+            "has_model_output": self.has_model_output,
             "readers": self.readers,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
@@ -340,6 +424,7 @@ class ResumableStore:
 
     async def create(self, stream_id: str, model: str = "", kind: str = "stream") -> ResumableBuffer:
         async with self._lock:
+            await self._drop_locked(stream_id)
             buf = ResumableBuffer(stream_id, model=model, kind=kind)
             self._buffers[stream_id] = buf
             await self._evict_locked()
@@ -357,7 +442,8 @@ class ResumableStore:
             buf = self._buffers.get(stream_id)
             if buf is not None:
                 await buf.expire_if_stalled()
-                if buf.kind != kind or buf.fully_delivered or buf.status == "error":
+                if (buf.kind != kind or buf.fully_delivered or buf.status == "error"
+                        or (buf.done and buf.kind == "stream" and not buf.has_model_output)):
                     await self._drop_locked(stream_id)
                     buf = None
             if buf is not None:
@@ -373,7 +459,7 @@ class ResumableStore:
         if buf and not buf.done:
             await buf.fail("后台任务已撤销，请重试。", 503, "upstream_error")
         task = self._pumps.pop(stream_id, None)
-        if task and not task.done():
+        if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
         return buf is not None
 
@@ -443,8 +529,8 @@ class ResumableStore:
                 if buf.readers > 0:
                     continue
                 ref = buf.finished_at or buf.last_access
-                if buf.done and (now - ref) > ttl:
-                    self._buffers.pop(sid, None)
+                if buf.done and (now - ref) > (5.0 if buf.status == "error" else ttl):
+                    await self._drop_locked(sid)
                     removed += 1
             await self._evict_locked()
         if removed:
@@ -466,18 +552,26 @@ resumable_store = ResumableStore()
 
 
 class DetachedRequest:
-    """把上游调用与前端连接解绑的请求壳子。
+    """首包前允许取消；已有产出或仍有读者时继续后台接收。"""
 
-    上游代码用 `fastapi_request.is_disconnected()` 决定要不要放弃调用/重试。
-    弱网下前端断开后仍需在总时限内接收回复，所以这里恒返回 False；
-    其余属性（app.state、headers 等）原样透传给被包装的真实 Request。
-    """
-
-    def __init__(self, request: Any):
+    def __init__(self, request: Any, buf: Optional[ResumableBuffer] = None):
         self._request = request
+        self._buf = buf
 
     async def is_disconnected(self) -> bool:
-        return False
+        if self._buf is None:
+            return False
+        if self._buf.done:
+            return True
+        if self._buf.has_model_output or self._buf.readers > 0:
+            return False
+        # 已连接过的读者退出后，由宽限期任务统一判断，避免退避重试抢先取消。
+        if self._buf._reader_left_at is not None:
+            return False
+        try:
+            return await self._request.is_disconnected()
+        except Exception:
+            return False
 
     def __getattr__(self, item):
         return getattr(self._request, item)
@@ -500,11 +594,12 @@ def frame_with_id(seq: int, frame: str) -> str:
 
 
 async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -> None:
-    """后台把上游 SSE 帧抽进缓冲区。**不依赖前端连接**。
+    """后台把上游 SSE 帧抽进缓冲区，首包前允许取消，已有产出后持续接收。
 
     每个 data 帧按落缓冲的顺序分配单调序列号并写入 `id:` 行，
     前端凭 Last-Event-ID / resume_from 续传时与这里的序号对齐。
     """
+    saw_error = False
     try:
         iterator = aiter(body_iterator)
         while not buf.done:
@@ -513,12 +608,10 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
             except StopAsyncIteration:
                 break
             text = _as_text(chunk)
-            if not text:
+            if is_keepalive_frame(text):
                 continue
-            if text.lstrip().startswith(":"):
-                # 注释帧（旧心跳等）不是事件：不进缓冲、不占序号，保持 id == 下标
-                continue
-            await buf.append(frame_with_id(buf.next_seq, text))
+            saw_error = saw_error or is_error_frame(text)
+            await buf.append(frame_with_id(buf.next_seq, text), is_model_output=is_real_output_frame(text))
             if buf.next_seq == 1:
                 buf.phase = "读取上游事件"
                 buf.log_lifecycle("首个上游事件", "数据帧可能包含思考、工具调用或错误，尚不能判定正文已显示")
@@ -526,7 +619,9 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
             return
         if not buf.events or not buf.events[-1].strip().endswith("[DONE]"):
             await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
-        await buf.finish("done")
+        await buf.finish("error" if saw_error else "done",
+                         error="上游返回错误响应。" if saw_error else None,
+                         status_code=502 if saw_error else 200)
     except asyncio.CancelledError:
         await buf.fail("上游读取任务被取消，请重试。", 499, "upstream_error")
         raise
@@ -544,7 +639,18 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
                 pass
 
 
-async def sse_from_buffer(buf: ResumableBuffer, start_seq: int = 0) -> AsyncIterator[str]:
+async def _cancel_if_abandoned(buf: ResumableBuffer) -> None:
+    """首包前最后一个读者离开后留出重连窗口，只取消该轮任务。"""
+    try:
+        await asyncio.sleep(CANCEL_GRACE_SECONDS)
+        if not buf.done and not buf.has_model_output and buf.readers == 0:
+            await buf.fail("客户端已断开且尚无模型产出，请求已取消。", 499, "client_closed_request")
+    except asyncio.CancelledError:
+        pass
+
+
+async def sse_from_buffer(buf: ResumableBuffer, start_seq: int = 0,
+                          fastapi_request: Optional[Any] = None) -> AsyncIterator[str]:
     """把缓冲区内容按 SSE 吐给当前这条前端连接（可从任意 seq 续取）。
 
     事件落缓冲时已带 `id: <seq>`（见 pump_stream），这里原样吐出，不再二次加工。
@@ -554,37 +660,42 @@ async def sse_from_buffer(buf: ResumableBuffer, start_seq: int = 0) -> AsyncIter
     delivered_done = False
     completed = False
     sent_events = 0
-    iterator = buf.iter_from(start_seq)
-    pending = None
+    i = max(0, start_seq)
+    buf.enter_reader()
     try:
         # 立即建立下游响应，等待期间也定期保活；不污染续传游标。
         yield ": keep-alive\n\n"
         while True:
-            if pending is None:
-                pending = asyncio.create_task(anext(iterator))
-            ready, _ = await asyncio.wait({pending}, timeout=HEARTBEAT_INTERVAL_SECONDS)
-            if not ready:
-                yield ": keep-alive\n\n"
-                continue
+            fake_on = bool(_setting("fake_streaming"))
             try:
-                _seq, frame = pending.result()
-            except StopAsyncIteration:
+                interval = max(0.5, float(_setting("fake_streaming_interval") or 1.0))
+            except (TypeError, ValueError):
+                interval = 1.0
+            await buf.wait_for(i, interval if fake_on else HEARTBEAT_INTERVAL_SECONDS)
+            if i < buf.next_seq:
+                frame = buf.events[i]
+                i += 1
+                sent_events += 1
+                buf.last_access = time.time()
+                yield frame
+                if frame.strip().endswith("[DONE]"):
+                    delivered_done = True
+            elif buf.done:
                 completed = True
                 break
-            finally:
-                pending = None
-            sent_events += 1
-            yield frame
-            if frame.strip().endswith("[DONE]"):
-                delivered_done = True
+            else:
+                if fastapi_request is not None:
+                    try:
+                        if await fastapi_request.is_disconnected():
+                            break
+                    except Exception:
+                        pass
+                yield make_keepalive_sse(buf.model) if fake_on else ": keep-alive\n\n"
     finally:
-        if pending is not None:
-            pending.cancel()
-            await asyncio.gather(pending, return_exceptions=True)
-        await iterator.aclose()
+        buf.leave_reader()
         if not completed:
-            action = "后台任务仍在运行，可在截止时间前续传" if not buf.done else "已结束的缓冲仍按保留期保存"
+            action = ("已有产出，后台接收继续" if buf.has_model_output else "首包前断连，宽限期内可重连") if not buf.done else "缓冲已结束"
             buf.log_lifecycle("下游读取中断", f"本连接已输出={sent_events}个事件；{action}")
-    if delivered_done:
+    if delivered_done and buf.status != "error":
         buf.mark_delivered()
     buf.log_lifecycle("下游发送结束", f"本连接已输出={sent_events}个事件；终止帧={'已输出' if delivered_done else '未输出'}；不代表客户端已显示")

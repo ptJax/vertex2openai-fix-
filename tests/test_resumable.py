@@ -73,9 +73,9 @@ class ResumableTests(unittest.IsolatedAsyncioTestCase):
         gate = asyncio.Event()
 
         async def upstream():
-            yield 'data: {"part":1}\n\n'
+            yield 'data: {"choices":[{"delta":{"content":"第一部分"}}]}\n\n'
             await gate.wait()
-            yield 'data: {"part":2}\n\n'
+            yield 'data: {"choices":[{"delta":{"content":"第二部分"}}]}\n\n'
 
         pump = self.start(buf, r.pump_stream(buf, upstream()))
         reader = r.sse_from_buffer(buf)
@@ -87,8 +87,10 @@ class ResumableTests(unittest.IsolatedAsyncioTestCase):
         gate.set()
         await pump
         resumed = await collect(buf, 1)
-        self.assertNotIn('"part":1', resumed)
-        self.assertIn('"part":2', resumed)
+        self.assertTrue(buf.has_model_output)
+        self.assertIsNone(buf._abandon_task)
+        self.assertNotIn("第一部分", resumed)
+        self.assertIn("第二部分", resumed)
         self.assertIn("id: 2\ndata: [DONE]", resumed)
 
     async def test_上游一直不返回时读者收到超时错误和结束帧(self):
@@ -235,6 +237,7 @@ class ResumableTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(created)
         self.assertIsNot(new, failed)
         good, _ = await self.store.create_if_absent("good")
+        await good.append('data: {"choices":[{"delta":{"content":"正常回复"}}]}\n\n', is_model_output=True)
         await good.append(r.DONE_FRAME)
         await good.finish()
         same, created = await self.store.create_if_absent("good")
@@ -244,6 +247,83 @@ class ResumableTests(unittest.IsolatedAsyncioTestCase):
         replacement, created = await self.store.create_if_absent("good")
         self.assertTrue(created)
         self.assertIsNot(replacement, good)
+
+    async def test_保活与角色空帧不计为有效产出且不污染序号(self):
+        buf, _ = await self.store.create_if_absent("heartbeat")
+
+        async def upstream():
+            yield ": keep-alive\n\n"
+            yield r.make_keepalive_sse("本地模型")
+            yield 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+            yield r.DONE_FRAME
+
+        await r.pump_stream(buf, upstream())
+        self.assertFalse(buf.has_model_output)
+        self.assertEqual(buf.next_seq, 2)
+        self.assertTrue(buf.events[0].startswith("id: 0\n"))
+        self.assertNotIn("chatcmpl-keepalive", "".join(buf.events))
+        new, created = await self.store.create_if_absent(buf.id)
+        self.assertTrue(created)
+        self.assertIsNot(new, buf)
+
+    async def test_错误流不会标记成功交付且允许重新生成(self):
+        buf, _ = await self.store.create_if_absent("error-frame")
+
+        async def upstream():
+            yield 'data: {"choices":[{"delta":{"content":"部分回复"}}]}\n\n'
+            yield 'data: {"error":{"code":503,"message":"本地模拟故障"}}\n\n'
+            yield r.DONE_FRAME
+
+        await r.pump_stream(buf, upstream())
+        with patch("builtins.print") as output:
+            self.assertIn("部分回复", await collect(buf))
+        self.assertIn("终止帧=已输出", "\n".join(item.args[0] for item in output.call_args_list))
+        self.assertEqual(buf.status, "error")
+        self.assertFalse(buf.fully_delivered)
+        _, created = await self.store.create_if_absent(buf.id)
+        self.assertTrue(created)
+
+    async def test_首包前断连在宽限期后取消上游(self):
+        buf, _ = await self.store.create_if_absent("abandon")
+        pump = self.start(buf, r.pump_stream(buf, asyncio_waiting_stream()))
+        reader = r.sse_from_buffer(buf)
+        await anext(reader)
+        with patch.object(r, "CANCEL_GRACE_SECONDS", 0.01):
+            await reader.aclose()
+            await asyncio.wait_for(buf._abandon_task, 1)
+        await asyncio.gather(pump, return_exceptions=True)
+        self.assertEqual(buf.status_code, 499)
+        self.assertTrue(pump.cancelled())
+
+    async def test_首包前及时重连复用原任务并取消撤销计时(self):
+        buf, _ = await self.store.create_if_absent("rejoin")
+        pump = self.start(buf, r.pump_stream(buf, asyncio_waiting_stream()))
+        first = r.sse_from_buffer(buf)
+        await anext(first)
+        await first.aclose()
+        abandoned = buf._abandon_task
+        detached = r.DetachedRequest(types.SimpleNamespace(is_disconnected=lambda: None), buf)
+        self.assertFalse(await detached.is_disconnected())
+        same, created = await self.store.create_if_absent(buf.id)
+        second = r.sse_from_buffer(same)
+        await anext(second)
+        await asyncio.gather(abandoned, return_exceptions=True)
+        self.assertFalse(created)
+        self.assertIs(same, buf)
+        self.assertIsNone(buf._abandon_task)
+        self.assertFalse(pump.done())
+        await buf.fail("本地测试结束", 499, "client_closed_request")
+        await second.aclose()
+
+    async def test_假流式下游保活不写入缓冲(self):
+        buf, _ = await self.store.create_if_absent("fake-heartbeat")
+        reader = r.sse_from_buffer(buf)
+        with patch.dict(DEFAULTS, {"fake_streaming": True, "fake_streaming_interval": 0.5}):
+            self.assertTrue((await anext(reader)).startswith(":"))
+            self.assertIn("chatcmpl-keepalive", await asyncio.wait_for(anext(reader), 1))
+        self.assertEqual(buf.events, [])
+        await buf.fail("本地测试结束", 499, "client_closed_request")
+        await reader.aclose()
 
     def test_无效超时配置回退为十五分钟(self):
         for value in [None, "无效", 0, -1, float("nan"), float("inf")]:
@@ -316,6 +396,11 @@ class ResumableTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(task.cancelled())
         self.assertEqual(buf.status_code, 504)
         self.assertTrue(buf.events[-1].strip().endswith("[DONE]"))
+
+
+async def asyncio_waiting_stream():
+    await asyncio.Event().wait()
+    yield r.DONE_FRAME
 
 
 if __name__ == "__main__":

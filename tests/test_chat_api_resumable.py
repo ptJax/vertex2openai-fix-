@@ -114,6 +114,47 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body), {"ok": True})
 
+    def test_续传请求头从下一事件开始而查询参数是包含起点(self):
+        self.request.headers = {"last-event-id": "3"}
+        self.request.query_params = {"resume_from": "1"}
+        self.assertEqual(routes._resume_start_seq(self.request), 4)
+        self.request.headers = {"last-event-id": "无效"}
+        self.assertEqual(routes._resume_start_seq(self.request), 1)
+
+    async def test_非流式客户端断开后在宽限期结束时取消任务(self):
+        self.model.stream = False
+        self.request.is_disconnected = AsyncMock(return_value=True)
+
+        async def hang(*_):
+            await asyncio.Event().wait()
+
+        with patch.object(r, "CANCEL_GRACE_SECONDS", 0.01), patch.object(routes, "_call_upstream", side_effect=hang):
+            response = await asyncio.wait_for(routes._resumable_json(self.request, self.model, "本地测试"), 1)
+            buf = next(iter(self.store._buffers.values()))
+            await asyncio.wait_for(buf._abandon_task, 1)
+        self.assertEqual(response.status_code, 499)
+        self.assertEqual(buf.status_code, 499)
+
+    async def test_非流式进入等待前已到截止时间也能及时结束(self):
+        self.model.stream = False
+        original_init = r.ResumableBuffer.__init__
+
+        def expired_init(buf, *args, **kwargs):
+            original_init(buf, *args, **kwargs)
+            buf._deadline = r.time.monotonic() - 1
+
+        with patch.object(r.ResumableBuffer, "__init__", expired_init), \
+             patch.object(routes, "_call_upstream", AsyncMock(return_value=JSONResponse({"ok": True}))):
+            response = await asyncio.wait_for(routes._resumable_json(self.request, self.model, "本地测试"), 1)
+        self.assertEqual(response.status_code, 504)
+
+    async def test_失败轮询不会标记为成功交付(self):
+        buf, _ = await self.store.create_if_absent("poll-error")
+        await buf.fail("本地模拟故障", 503, "upstream_error")
+        response = await routes.resumable_poll(buf.id, self.request, "本地测试", 0, 200, 0)
+        self.assertTrue(json.loads(response.body)["done"])
+        self.assertFalse(buf.fully_delivered)
+
     async def test_非流式日志区分等待重放及断线后后台落缓冲(self):
         self.model.stream = False
         entered = asyncio.Event()
