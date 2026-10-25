@@ -37,7 +37,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
 
 ### 3. Gemini 3.x / 4.x 与生图深度适配
 - 支持流式（SSE）、假流式保活（防 `gemini-4-argon` 等长思考模型 60s 超时断连）与非流式。
-- **弱网可靠续传与首包前取消止损**：内置带序号的 `ResumableBuffer`，`Last-Event-ID: k` 从下一事件续传，`resume_from=k` 包含第 k 个事件。首包前最后一个读者断开后保留 1.5 秒重连窗口，超时取消该轮上游任务；已有正文、思考或工具调用产出后继续后台接收。网络断连与手动停止采用相同判断，所有调用及重试仍受整轮总时限约束。
+- **弱网可靠续传与后台任务管理**：开启弱网续传后，前端停止显示、关闭页面或断网均不会取消后台建流、接收和重试；所有任务仍受整轮总时限约束。需要终止时，在控制台「后台任务」页点击对应任务的「停止后台任务」。按钮按请求 ID 和轮次号校验，防止误停同一请求后来启动的新任务。`Last-Event-ID: k` 从下一事件续传，`resume_from=k` 包含第 k 个事件。
 - **原生函数调用（Function Calling）**：两条通道均支持工具声明、并行调用、流式分片参数聚合（`streamFunctionCallArguments` / `partialArgs`）及 `thought_signature` 思考签名无损回传。
 - **预填充兼容与思维链守卫**：针对 Gemini 3.x / 4.x 拒绝以 `assistant` 轮次结尾的限制，内置 `smart` / `keep_turn` / `minimal` 兼容模式、流式重叠去重与未闭合标签思维链守卫（`prefill_cot_guard`），完美适配 SillyTavern 等酒馆预设。
 - **精准 500 错误分类**：将提示词安全拦截（`PROHIBITED_CONTENT` / `SAFETY`）与空候选/思考截断从 500 错误中剥离（不盲目重试），而对真正的上游 `500 INTERNAL` 与网络断连按用户设置次数退避轮询。

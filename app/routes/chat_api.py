@@ -105,46 +105,75 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
             headers=_resume_headers(stream_id, replay=True),
         )
 
-    # 新一轮受总时限约束；已有产出后断连不影响后台接收。
+    # 建流和读流由同一个后台任务持有，前端在首包前退出也不会取消它。
     detached = DetachedRequest(fastapi_request, buf)
     buf.log_lifecycle("请求开始", f"来源={id_src}；模型={json.dumps(request_obj.model[:120], ensure_ascii=False)}；新建上游调用")
-    try:
-        resp = await buf.await_upstream(_call_upstream(request_obj, detached))
-    except ResumableTimeoutError as e:
-        return JSONResponse(status_code=504,
-                            content=create_openai_error_response(504, str(e), "timeout"),
-                            headers=_resume_headers(stream_id))
-    except asyncio.CancelledError:
-        # 客户端在上游返回前断开：同样撤掉占位，避免留下一个永远等不到泵的
-        # 僵尸缓冲；按对象撤销，不能误删同指纹后续重试的新任务。
-        await _abort_placeholder(buf, stream_id, "客户端断开，上游调用被取消。", 499)
-        raise
-    except Exception as e:
-        # 占位已经建了，跟读者可能在等：先把错误落进缓冲再撤占位，然后交给路由兜底。
-        buf.log_lifecycle("上游调用异常", f"异常类型={type(e).__name__}")
-        code, message = extract_upstream_error(e)
-        await _abort_placeholder(buf, stream_id, message, code)
-        raise
-    if not isinstance(resp, StreamingResponse):
-        # 上游直接给了非流式响应（通常是错误 JSON）：不进缓冲，原样返回；
-        # 撤掉占位，重试会走一次新的上游调用（429 等本就应该重打）。
-        status = getattr(resp, "status_code", 500)
-        message = f"上游返回非流式响应（HTTP {status}）。"
-        try:
-            error = json.loads(resp.body).get("error")
-            if isinstance(error, dict) and error.get("message"):
-                message = str(error["message"])
-            elif isinstance(error, str):
-                message = error
-        except (ValueError, TypeError, AttributeError):
-            pass
-        await _abort_placeholder(buf, stream_id, message, status)
-        return resp
+    ready = asyncio.get_running_loop().create_future()
 
-    pump_task = asyncio.create_task(pump_stream(buf, resp.body_iterator))
+    async def _pump_response():
+        response = None
+        try:
+            response = await buf.await_upstream(_call_upstream(request_obj, detached))
+            if not isinstance(response, StreamingResponse):
+                status = getattr(response, "status_code", 500)
+                message = f"上游返回非流式响应（HTTP {status}）。"
+                try:
+                    error = json.loads(response.body).get("error")
+                    if isinstance(error, dict) and error.get("message"):
+                        message = str(error["message"])
+                    elif isinstance(error, str):
+                        message = error
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                await _abort_placeholder(buf, stream_id, message, status)
+                return
+            buf.phase = "等待首个上游事件"
+            buf.log_lifecycle("上游建流", "后台泵已启动；尚不代表收到模型输出")
+            ready.set_result(None)
+            await pump_stream(buf, response.body_iterator)
+        except ResumableTimeoutError as error:
+            response = JSONResponse(status_code=504,
+                                    content=create_openai_error_response(504, str(error), "timeout"),
+                                    headers=_resume_headers(stream_id))
+        except asyncio.CancelledError:
+            await buf.fail("后台任务已取消，请重试。", 499, "upstream_error")
+            response = None
+            raise
+        except Exception as error:
+            buf.log_lifecycle("上游调用异常", f"异常类型={type(error).__name__}")
+            code, message = extract_upstream_error(error)
+            await _abort_placeholder(buf, stream_id, message, code)
+            response = JSONResponse(status_code=code,
+                                    content=create_openai_error_response(code, message, "upstream_error"),
+                                    headers=_resume_headers(stream_id))
+        finally:
+            if not ready.done():
+                if response is None:
+                    code = buf.status_code if buf.status_code >= 400 else 503
+                    response = JSONResponse(status_code=code,
+                                            content=create_openai_error_response(code, buf.error or "后台任务已结束。", "upstream_error"),
+                                            headers=_resume_headers(stream_id))
+                ready.set_result(response)
+
+    pump_task = asyncio.create_task(_pump_response())
     resumable_store.register_pump(stream_id, pump_task, expected=buf)
-    buf.phase = "等待首个上游事件"
-    buf.log_lifecycle("上游建流", "后台泵已启动；尚不代表收到模型输出")
+
+    def _settle_unstarted_task(_task):
+        # 后台任务在首次执行前就被停止时，也要唤醒等待建流的前端。
+        if not ready.done():
+            code = buf.status_code if buf.status_code >= 400 else 503
+            ready.set_result(JSONResponse(status_code=code,
+                                          content=create_openai_error_response(code, buf.error or "后台任务已结束。", "upstream_error"),
+                                          headers=_resume_headers(stream_id)))
+
+    pump_task.add_done_callback(_settle_unstarted_task)
+    try:
+        response = await asyncio.shield(ready)
+    except asyncio.CancelledError:
+        buf.log_lifecycle("下游读取中断", "上游建流仍在后台运行，可续传或在控制台停止此任务")
+        raise
+    if response is not None:
+        return response
 
     start = _resume_start_seq(fastapi_request)
     return StreamingResponse(
@@ -155,7 +184,7 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
 
 
 async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, api_key: str):
-    """非流式请求共享后台任务，首包前断连可取消，重连不重置总时限。"""
+    """非流式请求共享后台任务，前端断连不取消，重连不重置总时限。"""
     stream_id, id_src = compute_stream_id(
         fastapi_request.headers, api_key or "", _request_fingerprint(request_obj))
 

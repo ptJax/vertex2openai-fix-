@@ -121,19 +121,66 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         self.request.headers = {"last-event-id": "无效"}
         self.assertEqual(routes._resume_start_seq(self.request), 1)
 
-    async def test_非流式客户端断开后在宽限期结束时取消任务(self):
+    async def test_非流式客户端断开后后台仍完成且重试不重复调用(self):
         self.model.stream = False
         self.request.is_disconnected = AsyncMock(return_value=True)
 
-        async def hang(*_):
-            await asyncio.Event().wait()
+        release = asyncio.Event()
 
-        with patch.object(r, "CANCEL_GRACE_SECONDS", 0.01), patch.object(routes, "_call_upstream", side_effect=hang):
+        async def upstream(*_):
+            await release.wait()
+            return JSONResponse({"content": "后台完成的回复"})
+
+        with patch.object(routes, "_call_upstream", side_effect=upstream) as call:
             response = await asyncio.wait_for(routes._resumable_json(self.request, self.model, "本地测试"), 1)
             buf = next(iter(self.store._buffers.values()))
-            await asyncio.wait_for(buf._abandon_task, 1)
+            self.assertEqual(response.status_code, 499)
+            self.assertEqual(buf.status, "running")
+            self.assertFalse(buf._pump_task.done())
+            release.set()
+            await asyncio.wait_for(buf._pump_task, 1)
+            replay = await routes._resumable_json(self.request, self.model, "本地测试")
+        self.assertEqual(json.loads(replay.body)["content"], "后台完成的回复")
+        self.assertEqual(call.await_count, 1)
+
+    async def test_前端在建流阶段取消后后台仍接收并可续传(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def body():
+            yield 'data: {"choices":[{"delta":{"content":"建流后回复"}}]}\n\n'
+
+        async def upstream(*_):
+            entered.set()
+            await release.wait()
+            return StreamingResponse(body())
+
+        with patch.object(routes, "_call_upstream", side_effect=upstream) as call:
+            first = asyncio.create_task(routes._resumable_stream(self.request, self.model, "本地测试"))
+            await entered.wait()
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+            buf = next(iter(self.store._buffers.values()))
+            self.assertFalse(buf._pump_task.done())
+            second = await routes._resumable_stream(self.request, self.model, "本地测试")
+            release.set()
+            text = await asyncio.wait_for(read_response(second), 1)
+        self.assertIn("建流后回复", text)
+        self.assertEqual(call.await_count, 1)
+
+    async def test_控制台停止建流中的任务会唤醒等待者(self):
+        entered = asyncio.Event()
+
+        async def upstream(*_):
+            entered.set()
+            await asyncio.Event().wait()
+
+        with patch.object(routes, "_call_upstream", side_effect=upstream):
+            request = asyncio.create_task(routes._resumable_stream(self.request, self.model, "本地测试"))
+            await entered.wait()
+            buf = next(iter(self.store._buffers.values()))
+            await self.store.cancel(buf.id, buf.attempt_id)
+            response = await asyncio.wait_for(request, 1)
         self.assertEqual(response.status_code, 499)
-        self.assertEqual(buf.status_code, 499)
 
     async def test_非流式进入等待前已到截止时间也能及时结束(self):
         self.model.stream = False

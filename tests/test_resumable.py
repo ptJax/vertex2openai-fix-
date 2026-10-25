@@ -8,7 +8,7 @@ import sys
 import time
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,7 +88,6 @@ class ResumableTests(unittest.IsolatedAsyncioTestCase):
         await pump
         resumed = await collect(buf, 1)
         self.assertTrue(buf.has_model_output)
-        self.assertIsNone(buf._abandon_task)
         self.assertNotIn("第一部分", resumed)
         self.assertIn("第二部分", resumed)
         self.assertIn("id: 2\ndata: [DONE]", resumed)
@@ -283,37 +282,76 @@ class ResumableTests(unittest.IsolatedAsyncioTestCase):
         _, created = await self.store.create_if_absent(buf.id)
         self.assertTrue(created)
 
-    async def test_首包前断连在宽限期后取消上游(self):
-        buf, _ = await self.store.create_if_absent("abandon")
-        pump = self.start(buf, r.pump_stream(buf, asyncio_waiting_stream()))
+    async def test_首包前断连超过原宽限期仍继续接收并保存(self):
+        buf, _ = await self.store.create_if_absent("detached-before-output")
+        release = asyncio.Event()
+
+        async def upstream():
+            await release.wait()
+            yield 'data: {"choices":[{"delta":{"content":"断连后的回复"}}]}\n\n'
+
+        pump = self.start(buf, r.pump_stream(buf, upstream()))
         reader = r.sse_from_buffer(buf)
         await anext(reader)
-        with patch.object(r, "CANCEL_GRACE_SECONDS", 0.01):
-            await reader.aclose()
-            await asyncio.wait_for(buf._abandon_task, 1)
-        await asyncio.gather(pump, return_exceptions=True)
-        self.assertEqual(buf.status_code, 499)
-        self.assertTrue(pump.cancelled())
+        await reader.aclose()
+        await asyncio.sleep(1.6)
+        self.assertFalse(pump.done())
+        self.assertEqual(buf.status, "running")
+        self.assertEqual(buf.readers, 0)
+        release.set()
+        await asyncio.wait_for(pump, 1)
+        self.assertIn("断连后的回复", await collect(buf))
+        self.assertEqual(buf.status, "done")
 
-    async def test_首包前及时重连复用原任务并取消撤销计时(self):
+    async def test_首包前断连后重连复用原任务和截止时间(self):
         buf, _ = await self.store.create_if_absent("rejoin")
+        deadline = buf._deadline
         pump = self.start(buf, r.pump_stream(buf, asyncio_waiting_stream()))
         first = r.sse_from_buffer(buf)
         await anext(first)
         await first.aclose()
-        abandoned = buf._abandon_task
-        detached = r.DetachedRequest(types.SimpleNamespace(is_disconnected=lambda: None), buf)
+        request = types.SimpleNamespace(is_disconnected=AsyncMock(return_value=True))
+        detached = r.DetachedRequest(request, buf)
         self.assertFalse(await detached.is_disconnected())
+        request.is_disconnected.assert_not_awaited()
         same, created = await self.store.create_if_absent(buf.id)
         second = r.sse_from_buffer(same)
         await anext(second)
-        await asyncio.gather(abandoned, return_exceptions=True)
         self.assertFalse(created)
         self.assertIs(same, buf)
-        self.assertIsNone(buf._abandon_task)
+        self.assertEqual(buf._deadline, deadline)
         self.assertFalse(pump.done())
         await buf.fail("本地测试结束", 499, "client_closed_request")
         await second.aclose()
+
+    async def test_手动停止只取消指定任务并唤醒读者(self):
+        first, _ = await self.store.create_if_absent("first")
+        second, _ = await self.store.create_if_absent("second")
+        first_pump = self.start(first, r.pump_stream(first, asyncio_waiting_stream()))
+        second_pump = self.start(second, r.pump_stream(second, asyncio_waiting_stream()))
+        output = asyncio.create_task(collect(first))
+        self.tasks.append(output)
+        await asyncio.sleep(0)
+        self.assertEqual(await self.store.cancel(first.id, first.attempt_id), "cancelled")
+        text = await asyncio.wait_for(output, 1)
+        await asyncio.gather(first_pump, return_exceptions=True)
+        self.assertIn('"type": "cancelled"', text)
+        self.assertIn("[DONE]", text)
+        self.assertTrue(first_pump.cancelled())
+        self.assertEqual(first.status_code, 499)
+        self.assertFalse(second_pump.done())
+        self.assertEqual(second.status, "running")
+        self.assertEqual(await self.store.cancel(first.id, first.attempt_id), "finished")
+
+    async def test_旧轮次按钮不能停止新任务(self):
+        old, _ = await self.store.create_if_absent("reused")
+        await old.fail("本地测试结束", 499, "cancelled")
+        new, _ = await self.store.create_if_absent(old.id)
+        task = self.start(new, r.pump_stream(new, asyncio_waiting_stream()))
+        self.assertEqual(await self.store.cancel(old.id, old.attempt_id), "stale")
+        self.assertFalse(task.done())
+        self.assertEqual(new.status, "running")
+        self.assertEqual(await self.store.cancel("missing", old.attempt_id), "missing")
 
     async def test_假流式下游保活不写入缓冲(self):
         buf, _ = await self.store.create_if_absent("fake-heartbeat")

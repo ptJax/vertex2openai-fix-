@@ -574,6 +574,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="tab active" data-tab="overview" onclick="switchTab('overview')">数据概览</div>
     <div class="tab" data-tab="channel" onclick="switchTab('channel')">通道与凭证</div>
     <div class="tab" data-tab="params" onclick="switchTab('params')">模型参数</div>
+    <div class="tab" data-tab="tasks" onclick="switchTab('tasks')">后台任务</div>
     <div class="tab" data-tab="logs" onclick="switchTab('logs')">运行日志</div>
   </nav>
 
@@ -913,7 +914,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="flex items-center justify-between gap-2"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div>
             <div class="flex items-center justify-between gap-2"><span class="text-sm">弱网续传（服务端缓冲）<span class="helpq" onclick="hlp(this,'h_rsm')">?</span></span><label class="switch"><input type="checkbox" id="resumable_enabled"><span class="slider"></span></label></div>
-            <div id="h_rsm" class="helpbox">反代将上游回复放入带序号缓冲区，前端断网重连可凭 <code>Last-Event-ID</code> 或 <code>?resume_from=</code> 续传；首包产出前若前端主动取消，会自动停止重试。</div>
+            <div id="h_rsm" class="helpbox">开启后，前端停止显示或断网不会取消后台接收；回复保存在续传缓冲中，可通过原请求取回。需要停止上游等待与重试时，请在「后台任务」页停止对应任务。每轮生成仍受总时限约束。</div>
           </div>
           <div class="flex items-center justify-between gap-2"><span class="text-sm">续传缓冲保留时长(秒)</span><input id="resumable_ttl_seconds" type="number" step="60" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between gap-2"><span class="text-sm">续传缓冲数量上限</span><input id="resumable_max_streams" type="number" step="10" class="inp" style="width:90px"></div>
@@ -940,6 +941,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="flex items-center justify-end gap-3 mt-4 flex-wrap">
       <span class="text-xs text-[#7d738e]">仅保存「② 全局基础设施设置」；① 区请用顶部按钮保存</span>
       <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存全局设置</button>
+    </div>
+  </section>
+
+  <!-- 后台任务 -->
+  <section id="view-tasks" class="tab-pane hidden">
+    <div class="card overflow-hidden">
+      <div class="p-5 border-b border-[#ece5f5] divider-line">
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+          <h2 class="font-semibold">后台任务 <span id="task-count" class="pill pill-accent ml-2">加载中</span></h2>
+          <button type="button" class="btn-soft px-3 py-1.5 text-xs" onclick="fetchTasks(true)">刷新列表</button>
+        </div>
+        <p class="text-sm text-[#8a7fa0] mt-3">在酒馆停止显示、关闭页面或断网后，后台仍会接收。需要终止时，请停止下方对应的任务。</p>
+        <p class="text-xs text-[#8a7fa0] mt-2">后台接收完成后，仍需通过原请求续传取回回复。停止任务无法撤销已发生的上游计算与用量。</p>
+        <p id="task-notice" class="text-sm mt-3" role="status"></p>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm" style="min-width:760px;text-align:left">
+          <thead class="text-xs text-[#8a7fa0]"><tr>
+            <th class="p-3">模型 / 轮次</th><th class="p-3">开始时间</th><th class="p-3">已运行</th>
+            <th class="p-3">前端连接</th><th class="p-3">有效产出</th><th class="p-3">状态</th><th class="p-3">操作</th>
+          </tr></thead>
+          <tbody id="task-rows"></tbody>
+        </table>
+      </div>
+      <p id="task-empty" class="p-5 text-sm text-[#8a7fa0] hidden">暂无后台任务。开启弱网续传后，新请求会显示在这里。</p>
+      <p class="px-5 pb-4 text-xs text-[#8a7fa0]">任务和回复缓冲保存在当前服务内存中，服务重启后清空。</p>
     </div>
   </section>
 
@@ -1012,7 +1039,8 @@ function scrollLogsToBottom(){
 
 function switchTab(t){
   document.querySelectorAll('.tab').forEach(function(e){ e.classList.toggle('active', e.dataset.tab===t); });
-  ['overview','channel','params','logs'].forEach(function(v){ $('view-'+v).classList.toggle('hidden', v!==t); });
+  ['overview','channel','params','tasks','logs'].forEach(function(v){ $('view-'+v).classList.toggle('hidden', v!==t); });
+  if(t==='tasks') fetchTasks(true);
   if(t==='logs'){
     autoscroll = true;
     scrollLogsToBottom();
@@ -1106,6 +1134,70 @@ async function fetchStats(){
     renderChart(d.success||0, d.error||0, d.retries||0);
   }catch(e){}
 }
+
+/* ---------- 后台任务：仅在当前页可见时刷新 ---------- */
+var tasksLoading = false, stoppingTasks = new Set();
+async function fetchTasks(force){
+  if(tasksLoading || (!force && (document.hidden || $('view-tasks').classList.contains('hidden')))) return;
+  tasksLoading = true;
+  try{
+    var response = await fetch('/api/tasks');
+    if(response.status===401){ location.href='/'; return; }
+    if(!response.ok) throw new Error('任务列表加载失败，请稍后刷新。');
+    var data = await response.json(), rows = $('task-rows');
+    rows.replaceChildren();
+    var running = data.tasks.filter(function(task){ return task.status==='running'; }).length;
+    $('task-count').textContent = running + ' 个运行中';
+    $('task-notice').textContent = data.enabled ? '' : '弱网续传当前已关闭，新的聊天请求不会进入后台任务列表。';
+    $('task-empty').classList.toggle('hidden', data.tasks.length!==0);
+    data.tasks.forEach(function(task){
+      var row = document.createElement('tr');
+      row.className = 'border-t border-[#ece5f5] divider-line';
+      row.dataset.attemptId = task.attempt_id;
+      function cell(value){ var td=document.createElement('td'); td.className='p-3'; td.textContent=value; row.appendChild(td); return td; }
+      var modelCell = cell(task.model || '未指定模型');
+      var detail = document.createElement('div');
+      detail.className = 'text-xs text-[#8a7fa0] mt-1';
+      detail.textContent = '轮次 ' + task.attempt_id + ' · ' + (task.kind==='stream' ? '流式' : '非流式');
+      detail.title = task.id;
+      modelCell.appendChild(detail);
+      cell(new Date(task.created_at * 1000).toLocaleString('zh-CN', {hour12:false}));
+      cell(Math.floor(task.elapsed_seconds) + ' 秒');
+      cell(task.readers > 0 ? task.readers + ' 个在线' : '已断开');
+      cell(task.has_model_output ? '已有产出' : '尚无产出');
+      var stateCell = cell(task.status==='running' ? '进行中' : task.status==='done' ? '已完成' : task.status_code===499 ? '已停止' : '失败 / 超时');
+      if(task.status==='running'){
+        var phase = document.createElement('div'); phase.className='text-xs text-[#8a7fa0] mt-1'; phase.textContent=task.phase; stateCell.appendChild(phase);
+      }
+      var actions = cell('');
+      if(task.status==='running'){
+        var button=document.createElement('button');
+        button.type='button'; button.className='btn-soft px-3 py-1.5 text-xs'; button.style.color='var(--coral-text)';
+        button.textContent=stoppingTasks.has(task.id+'@'+task.attempt_id) ? '正在停止…' : '停止后台任务';
+        button.disabled=stoppingTasks.has(task.id+'@'+task.attempt_id);
+        button.addEventListener('click', function(){ cancelTask(task, button); });
+        actions.appendChild(button);
+      }else{ actions.textContent='—'; }
+      rows.appendChild(row);
+    });
+  }catch(error){ $('task-notice').textContent=error.message || '任务列表加载失败。'; }
+  finally{ tasksLoading=false; }
+}
+async function cancelTask(task, button){
+  var key=task.id+'@'+task.attempt_id;
+  if(stoppingTasks.has(key)) return;
+  stoppingTasks.add(key); button.disabled=true; button.textContent='正在停止…';
+  try{
+    var response=await fetch('/api/tasks/'+encodeURIComponent(task.id)+'/cancel', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({attempt_id:task.attempt_id})
+    });
+    var data=await response.json();
+    if(!response.ok) throw new Error(typeof data.detail==='string' ? data.detail : '停止失败，请刷新列表后重试。');
+    toast(data.status==='cancelled' ? '已停止所选后台任务' : '该任务已经结束');
+  }catch(error){ toast(error.message || '停止失败，请稍后重试。'); }
+  finally{ stoppingTasks.delete(key); button.disabled=false; button.textContent='停止后台任务'; fetchTasks(true); }
+}
+setInterval(function(){ fetchTasks(false); },3000);
 
 /* ---------- Channel（激活卡片高亮边框 + 徽章） ---------- */
 function applyChannelHighlight(m){
@@ -1654,6 +1746,31 @@ async def logout(request: Request):
 @app.get("/api/stats")
 async def get_stats_api(_auth: bool = Depends(require_auth)):
     return JSONResponse(content=stats.get_json_stats())
+
+
+@app.get("/api/tasks")
+async def get_background_tasks(_auth: bool = Depends(require_auth)):
+    from resumable import is_enabled
+    tasks = await resumable_store.list_meta()
+    # 异常原文可能包含上游内容，管理列表仅返回生命周期元数据。
+    tasks = [{key: value for key, value in task.items() if key != "error"} for task in tasks]
+    tasks.sort(key=lambda task: (task["status"] != "running", -task["created_at"]))
+    return JSONResponse(content={"enabled": is_enabled(), "tasks": tasks})
+
+
+class CancelTaskBody(BaseModel):
+    attempt_id: str
+
+
+@app.post("/api/tasks/{stream_id}/cancel")
+async def cancel_background_task(stream_id: str, body: CancelTaskBody,
+                                 _auth: bool = Depends(require_auth)):
+    result = await resumable_store.cancel(stream_id, body.attempt_id)
+    if result == "missing":
+        raise HTTPException(status_code=404, detail="任务已过期或服务已重启，请刷新列表。")
+    if result == "stale":
+        raise HTTPException(status_code=409, detail="该请求已进入新的生成轮次，未停止新任务，请刷新列表。")
+    return JSONResponse(content={"status": result})
 
 
 # ==========================================
