@@ -1194,20 +1194,37 @@ async def execute_unified_completion(
                         # Express 真流式
                         response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
                         stream_start_ts = time.time()
+                        trace_buffer = getattr(fastapi_request, "_buf", None)
+                        trace_context = (f"{request_obj.model} | 请求={getattr(trace_buffer, 'id', response_id_for_stream)}"
+                                         f" | 轮次={getattr(trace_buffer, 'attempt_id', '无续传轮次')}")
                         try:
                             for _pin_try in range(2):
+                                sdk_started = time.monotonic()
+                                sdk_first_chunk = None
+                                first_content = None
+                                sdk_finished = None
+                                sdk_chunks = 0
+                                call_context = f"{trace_context} | 尝试={attempt + 1}.{_pin_try + 1}"
+                                print(f"🚀 [SDK 调用开始] {call_context} | 准备调用流式接口；尚未收到 SDK 数据块")
                                 try:
                                     stream_gen_obj = await current_client.aio.models.generate_content_stream(
                                         model=model_to_call,
                                         contents=actual_prompt,
                                         config=gen_config_dict,
                                     )
+                                    print(f"ℹ️ [SDK 迭代器就绪] {call_context} | 已用={time.monotonic() - sdk_started:.3f}秒；"
+                                          "尚不代表收到首块或模型输出")
                                     tool_indexer = ToolCallIndexer()
                                     deduper = PrefillDeduper(prefill_text) if (prefill_text and (exp_req_obj.n or 1) == 1) else None
                                     prefill_emitted = not bool(prefill_text)
                                     final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
 
                                     async for chunk_item_call in stream_gen_obj:
+                                        sdk_chunks += 1
+                                        if sdk_first_chunk is None:
+                                            sdk_first_chunk = time.monotonic()
+                                            print(f"📥 [SDK 首块到达] {call_context} | 首块等待={sdk_first_chunk - sdk_started:.3f}秒；"
+                                                  "转换前计数，数据块可能仅含元数据")
                                         if getattr(chunk_item_call, "usage_metadata", None):
                                             final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
 
@@ -1224,7 +1241,6 @@ async def execute_unified_completion(
                                             is_real_chunk = is_real_output_frame(sse_chunk)
                                             if is_real_chunk and not has_yielded_output:
                                                 has_yielded_output = True
-                                                print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
 
                                             if not prefill_emitted and '"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk:
                                                 prefill_emitted = True
@@ -1240,13 +1256,19 @@ async def execute_unified_completion(
                                                 sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
                                                 if sse_chunk is None:
                                                     continue
+                                            if first_content is None and is_real_output_frame(sse_chunk):
+                                                first_content = time.monotonic()
+                                                print(f"⚡ [首次有效内容] {call_context} | 已用={first_content - sdk_started:.3f}秒"
+                                                      f" | 首块后等待={first_content - sdk_first_chunk:.3f}秒"
+                                                      f" | SDK块数={sdk_chunks}；已转换并完成预填充去重，包含正文、思考或工具调用")
                                             yield sse_chunk
 
+                                    sdk_finished = time.monotonic()
                                     if not prefill_emitted:
                                         prefill_emitted = True
                                         if not has_yielded_output:
                                             has_yielded_output = True
-                                            print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
+                                            print(f"ℹ️ [预填充输出] {call_context} | 仅补发预填充文本，不代表收到模型有效内容")
                                         _pf = {
                                             "id": response_id_for_stream,
                                             "object": "chat.completion.chunk",
@@ -1266,6 +1288,10 @@ async def execute_unified_completion(
                                                 "model": exp_req_obj.model,
                                                 "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
                                             }
+                                            if first_content is None:
+                                                first_content = time.monotonic()
+                                                print(f"⚡ [首次有效内容] {call_context} | 已用={first_content - sdk_started:.3f}秒"
+                                                      f" | SDK块数={sdk_chunks}；预填充去重结束后释放模型文本")
                                             yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
 
                                     if final_p_tk > 0 or final_c_tk > 0:
@@ -1300,6 +1326,16 @@ async def execute_unified_completion(
                                         current_client = fallback_client_factory()
                                         continue
                                     raise
+                                finally:
+                                    observed_end = sdk_finished if sdk_finished is not None else time.monotonic()
+                                    first_wait = f"{sdk_first_chunk - sdk_started:.3f}秒" if sdk_first_chunk is not None else "未收到"
+                                    content_wait = f"{first_content - sdk_started:.3f}秒" if first_content is not None else "未收到"
+                                    after_first = f"{observed_end - sdk_first_chunk:.3f}秒" if sdk_first_chunk is not None else "无"
+                                    outcome = "读完" if sdk_finished is not None else "中断或失败"
+                                    print(f"📊 [SDK 流式观测汇总] {call_context} | 迭代={outcome} | SDK块数={sdk_chunks}"
+                                          f" | 首块等待={first_wait} | 首次有效内容={content_wait}"
+                                          f" | 首块后读取={after_first} | SDK总耗时={observed_end - sdk_started:.3f}秒；"
+                                          "SDK块数不等于下游事件数，也不代表网络原始分包数")
                         except asyncio.CancelledError:
                             print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                             raise

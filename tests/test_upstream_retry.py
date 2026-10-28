@@ -143,6 +143,60 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.cookie.execute_once.assert_awaited_once()
         self.request.app.state.express_key_manager = manager
 
+    async def test_SDK观测区分首块与有效内容且中断仍有汇总(self):
+        self.request_obj.stream = True
+        self.request._buf = types.SimpleNamespace(id="req-local-observation", attempt_id="local-round")
+        for interrupted in (False, True):
+            with self.subTest(中途失败=interrupted):
+                clock = [10.0]
+
+                async def body():
+                    clock[0] = 20.0
+                    yield object()
+                    clock[0] = 30.0
+                    yield object()
+                    clock[0] = 40.0
+                    if interrupted:
+                        raise UpstreamFailure(503)
+
+                async def open_stream(**kwargs):
+                    clock[0] = 12.0
+                    return body()
+
+                generate = AsyncMock(side_effect=open_stream)
+                client = types.SimpleNamespace(aio=types.SimpleNamespace(models=types.SimpleNamespace(
+                    generate_content_stream=generate)))
+                spec = {"client": client, "model_to_call": "local-model", "fallback_model": None,
+                        "fallback_client_factory": None}
+                chunks = [
+                    'data: {"choices":[{"delta":{"content":""}}]}\n\n',
+                    'data: {"choices":[{"delta":{"content":"本地模拟正文"}}]}\n\n',
+                ]
+                with patch.object(self.express, "build_key_call_spec", return_value=spec), \
+                     patch.object(api, "time", types.SimpleNamespace(time=lambda: 1000.0, monotonic=lambda: clock[0])), \
+                     patch.object(api, "convert_chunk_to_openai", side_effect=chunks), \
+                     patch("builtins.print") as logged:
+                    response = await self.complete()
+                    output = "".join([chunk async for chunk in response.body_iterator])
+
+                logs = "\n".join(str(call.args[0]) for call in logged.call_args_list)
+                generate.assert_awaited_once()
+                self.assertIn("本地模拟正文", output)
+                self.assertIn("[DONE]", output)
+                self.assertEqual('"error":' in output, interrupted)
+                self.assertIn("[SDK 调用开始]", logs)
+                self.assertIn("[SDK 迭代器就绪]", logs)
+                self.assertIn("首块等待=10.000秒", logs)
+                self.assertIn("首块后等待=10.000秒", logs)
+                self.assertIn("首次有效内容=20.000秒", logs)
+                self.assertIn("首块后读取=20.000秒", logs)
+                self.assertIn("SDK总耗时=30.000秒", logs)
+                self.assertIn("SDK块数=2", logs)
+                self.assertIn("轮次=local-round", logs)
+                self.assertIn("迭代=中断或失败" if interrupted else "迭代=读完", logs)
+                self.assertNotIn("本地模拟正文", logs)
+                self.assertNotIn("连接建立，正在实时流式输出", logs)
+
 
 if __name__ == "__main__":
     unittest.main()
