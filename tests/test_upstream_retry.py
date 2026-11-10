@@ -1,6 +1,7 @@
 """使用假凭据和假 SDK 调用验证统一调度器，不加载部署配置或发送网络请求。"""
 
 import asyncio
+import base64
 import importlib
 import json
 import sys
@@ -41,6 +42,12 @@ class UpstreamFailure(Exception):
 
 class RetryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        modules_patch = patch.dict(sys.modules, {"config": config, "runtime_state": runtime, "resumable": r})
+        modules_patch.start()
+        self.addCleanup(modules_patch.stop)
+        path_patch = patch.object(sys, "path", [str(ROOT / "app"), *sys.path])
+        path_patch.start()
+        self.addCleanup(path_patch.stop)
         self.records = [
             {"key": "local-key-a", "project_id": "local-project-a", "enabled": True},
             {"key": "local-key-b", "project_id": "local-project-b", "enabled": True},
@@ -123,6 +130,68 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
             options = http_options.get_http_options()
         self.assertEqual(options.timeout, 600_000)
         self.assertNotIn("timeout", options.async_client_args)
+
+    def test_图片历史恢复真实签名及缓存缺失时的哨兵(self):
+        import message_processing as messages
+        from signature_store import ImageSignatureStore, SKIP_VALIDATOR_SENTINEL
+        image = b"local-image-bytes"
+        signature = b"local-image-signature"
+        markdown = "![Image](data:image/png;base64," + base64.b64encode(image).decode() + ")"
+        store = ImageSignatureStore()
+        history = [models.OpenAIMessage(role="assistant", content=markdown),
+                   models.OpenAIMessage(role="user", content="继续修改图片")]
+        with patch.object(messages, "image_signature_store", store), \
+             patch.object(messages, "optimize_image_bytes", side_effect=lambda data, mime: (data, mime)):
+            for cached in (True, False):
+                with self.subTest(缓存命中=cached):
+                    store.clear()
+                    if cached:
+                        store.put(image, signature)
+                    prompt = messages.create_gemini_prompt(history, model_name="gemini-3.1-flash-image")
+                    restored = next(part for content in prompt if content.role == "model"
+                                    for part in content.parts if part.inline_data is not None)
+                    self.assertEqual(restored.thought_signature, signature if cached else SKIP_VALIDATOR_SENTINEL)
+
+    def test_合成传输默认关闭且与真实工具调用区分(self):
+        from synthetic_wrapper import create_sandbox_spec, inject_express_gen_config
+        request = models.OpenAIRequest(model="gemini-4-carbon", messages=[], stream=True)
+        spec = create_sandbox_spec(request.model, request, {})
+        original = {"temperature": 0.5}
+        inject_express_gen_config(original, spec)
+        self.assertFalse(spec.enabled)
+        self.assertEqual(original, {"temperature": 0.5})
+        enabled = create_sandbox_spec(request.model, request, {"synthetic_sandbox_enabled": True})
+        self.assertTrue(enabled.enabled)
+        inject_express_gen_config(original, enabled)
+        self.assertEqual(original["tool_config"]["function_calling_config"]["mode"], "ANY")
+        for name, arguments in ((enabled.emit_tool_name, {"content": "本地模拟正文"}),
+                                ("local_real_tool", {"city": "本地测试"})):
+            with self.subTest(工具=name):
+                chunk = api.types.GenerateContentResponse(candidates=[api.types.Candidate(
+                    content=api.types.Content(role="model", parts=[api.types.Part(
+                        function_call=api.types.FunctionCall(name=name, args=arguments))]),
+                    finish_reason="STOP")])
+                output = api.convert_chunk_to_openai(chunk, request.model, "local-response",
+                                                     indexer=api.ToolCallIndexer(enabled.emit_tool_name))
+                delta = json.loads(output[5:])["choices"][0]["delta"]
+                if name == enabled.emit_tool_name:
+                    self.assertEqual(delta["content"], "本地模拟正文")
+                    self.assertNotIn("tool_calls", delta)
+                else:
+                    self.assertEqual(delta["tool_calls"][0]["function"]["name"], name)
+
+    def test_双通道原始采样必须显式开启调试(self):
+        with patch.dict(sys.modules, {"config": config, "runtime_state": runtime}), \
+             patch.object(sys, "path", [str(ROOT / "app"), *sys.path]):
+            cookie = importlib.import_module("upstreams.cookie_proxy")
+        for sampler_class in (api._RawSampler, cookie._RawSampler):
+            for debug in (False, True):
+                with self.subTest(通道=sampler_class.__module__, 调试=debug), \
+                     patch.dict(settings, {"debug_outbound": debug}):
+                    sampler = sampler_class()
+                    sampler.add({"text": "不应默认记录的私有正文"})
+                    self.assertEqual(sampler.count, 1 if debug else 0)
+                    self.assertEqual("私有正文" in sampler.dump(), debug)
 
     async def test_流式部分产出后失败会发送错误且不重复生成(self):
         self.request_obj.stream = True

@@ -10,6 +10,8 @@ import unittest
 
 SCRIPT = r'''
 import asyncio, json, os, sys
+from html.parser import HTMLParser
+from collections import Counter
 from unittest.mock import AsyncMock, patch
 sys.path.insert(0, sys.argv[1])
 import main, model_loader
@@ -33,7 +35,23 @@ with patch.object(model_loader, 'refresh_models_config_cache', AsyncMock(return_
         assert client.get('/api/tasks').status_code == 401
         assert client.post('/api/tasks/fixture-one/cancel', json={'attempt_id': 'unknown'}).status_code == 401
         assert client.post('/api/login', json={'password': os.environ['API_KEY']}).status_code == 200
-        assert '后台任务' in client.get('/').text
+        html = client.get('/').text
+        class DashboardParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.ids, self.tabs = [], []
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if attrs.get('id'):
+                    self.ids.append(attrs['id'])
+                if attrs.get('data-tab'):
+                    self.tabs.append(attrs['data-tab'])
+        parser = DashboardParser()
+        parser.feed(html)
+        assert parser.tabs == ['overview', 'channel', 'params', 'tasks', 'logs']
+        assert all(count == 1 for count in Counter(parser.ids).values()), '控制台存在重复控件 ID'
+        assert '后台任务' in html and 'repeat(5,minmax(0,1fr))' in html
+        assert '首包产出前若前端主动停止' not in html
         first, second = client.portal.call(seed)
         async def add_private_error():
             buf = await resumable_store.get(first['id'])

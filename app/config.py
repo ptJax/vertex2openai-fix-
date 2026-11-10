@@ -8,7 +8,7 @@ class AppSettings(BaseSettings):
     FAKE_STREAMING: bool = False
     FAKE_STREAMING_INTERVAL: float = 1.0
     MODELS_CONFIG_URL: str = ""
-    ROUNDROBIN: bool = False
+    ROUNDROBIN: bool = True
     SAFETY_SCORE: bool = False
     PROXY_URL: Optional[str] = None
     SSL_CERT_FILE: Optional[str] = None
@@ -73,6 +73,7 @@ DEFAULT_SETTINGS = {
     "prefill_mode": "smart",
     "prefill_suppress_thinking": True,
     "prefill_cot_guard": True,
+    "synthetic_sandbox_enabled": False,
     # 输入图片压缩（全局）
     "img_compress_enabled": True,
     "img_compress_max_dim": 1536,
@@ -88,7 +89,6 @@ DEFAULT_SETTINGS = {
     "roundrobin": ROUNDROBIN,
     "safety_score": SAFETY_SCORE,
     "debug_outbound": False,
-    "cookie_debug": False,
     "express_location": "global",
     "resumable_enabled": True,
     "resumable_ttl_seconds": 1800,
@@ -116,4 +116,5 @@ PER_MODEL_KEYS = [
     "prefill_cot_guard",
     "prefill_mode",
     "prefill_suppress_thinking",
+    "synthetic_sandbox_enabled",
 ]

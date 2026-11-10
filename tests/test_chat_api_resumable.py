@@ -81,7 +81,8 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
             yield r.DONE_FRAME
 
         upstream = AsyncMock(side_effect=[StreamingResponse(hang()), StreamingResponse(success())])
-        with patch.object(r, "upstream_timeout_seconds", return_value=0.03), patch.object(routes, "_call_upstream", upstream):
+        # 首轮短时限触发超时，重试使用正常时限，避免机器调度抖动误伤成功响应。
+        with patch.object(r, "upstream_timeout_seconds", side_effect=[0.03, 900]), patch.object(routes, "_call_upstream", upstream):
             first = await routes._resumable_stream(self.request, self.model, "本地测试")
             text = await asyncio.wait_for(read_response(first), 1)
             self.assertIn('"code": 504', text)
