@@ -152,6 +152,85 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                                     for part in content.parts if part.inline_data is not None)
                     self.assertEqual(restored.thought_signature, signature if cached else SKIP_VALIDATOR_SENTINEL)
 
+    def test_模型图片保留签名字节而用户图片不附签名(self):
+        import message_processing as messages
+        from signature_store import ImageSignatureStore
+        original, compressed, signature = b"local-original-image", b"local-compressed-image", b"local-signature"
+        encoded = base64.b64encode(original).decode()
+        store = ImageSignatureStore()
+        store.put(original, signature)
+        variants = ["![Image](data:image/png;base64," + encoded + ")",
+                    [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + encoded}}]]
+        for content in variants:
+            for role in ("assistant", "user"):
+                with self.subTest(格式=type(content).__name__, 角色=role), \
+                     patch.object(messages, "image_signature_store", store), \
+                     patch.object(messages, "optimize_image_bytes", return_value=(compressed, "image/jpeg")) as optimize:
+                    extra = {"google": {"thought_signature": base64.b64encode(signature).decode()}}
+                    prompt = messages.create_gemini_prompt(
+                        [models.OpenAIMessage(role=role, content=content, extra_content=extra)],
+                        model_name="gemini-3.1-flash-image")
+                    part = next(p for item in prompt for p in item.parts if p.inline_data is not None)
+                    self.assertEqual(part.inline_data.data, original if role == "assistant" else compressed)
+                    self.assertEqual(part.thought_signature, signature if role == "assistant" else None)
+                    if role == "assistant":
+                        optimize.assert_not_called()
+
+    def test_抗截断流式与非流式保留代码表格及合法标签(self):
+        from synthetic_wrapper import extract_synthetic_content
+        from message_processing import FunctionCallStreamAssembler
+        samples = [
+            '```python\nfoo({"a": [1]})\n)\n)\n```\n',
+            '| 标题 | 数值 |\n| --- | --- |\n| 示例 | 1 |\n',
+            '<div><div><span>正文</span></div></div>',
+            '```json\n{"content": "业务字段", "items": [1]}\n```',
+        ]
+        prefix = "".join(f"第{i}项说明。" for i in range(25)) + "\n"
+        for sample in samples:
+            text = prefix + sample
+            with self.subTest(正文=sample):
+                self.assertEqual(extract_synthetic_content({"content": text}), text)
+                assembler = FunctionCallStreamAssembler("compose_reply")
+                output = []
+                for pos in range(0, len(text), 7):
+                    _, delta, _ = assembler.feed_with_synthetic({
+                        "name": "compose_reply", "args": {"content": text[pos:pos + 7]},
+                        "willContinue": pos + 7 < len(text),
+                    })
+                    output.append(delta)
+                output.append(assembler.flush_synthetic_tail())
+                self.assertEqual("".join(output), text)
+                self.assertFalse(assembler.synthetic_halted)
+
+    def test_预填充词法继承及思维链守卫不误认正文标签(self):
+        from synthetic_wrapper import extract_synthetic_content
+        from message_processing import detect_unclosed_cot_tag
+        self.assertEqual(extract_synthetic_content({"content": "正文</span></div>"},
+                                                 prefill_text="<div><span>"), "正文</span></div>")
+        self.assertIsNone(detect_unclosed_cot_tag("<div><style>"))
+        self.assertIsNone(detect_unclosed_cot_tag("```python\nif a < b:\n    pass\n```"))
+        self.assertEqual(detect_unclosed_cot_tag("<thinking>推理"), "thinking")
+        self.assertEqual(extract_synthetic_content({"content": '正文"}'}), "正文")
+
+    def test_工具历史不猜配陌生ID且保留重复结果(self):
+        from message_processing import sanitize_orphan_tool_turns
+        call = models.OpenAIMessage(role="assistant", tool_calls=[{
+            "id": "call-a", "type": "function", "function": {"name": "search", "arguments": "{}"}}])
+        for result_id in ("call-b", "call-a"):
+            with self.subTest(结果ID=result_id):
+                history = [call]
+                if result_id == "call-a":
+                    history.append(models.OpenAIMessage(role="tool", tool_call_id="call-a", content="正确结果"))
+                history.append(models.OpenAIMessage(role="tool", tool_call_id=result_id, content="多余结果"))
+                snapshot = [m.model_dump() for m in history]
+                cleaned = sanitize_orphan_tool_turns(history)
+                tools = [m for m in cleaned if m.role == "tool"]
+                self.assertEqual(len(tools), 1)
+                self.assertEqual(tools[0].tool_call_id, "call-a")
+                self.assertNotIn("多余结果", tools[0].content)
+                self.assertTrue(any(m.role == "user" and "多余结果" in m.content for m in cleaned))
+                self.assertEqual([m.model_dump() for m in history], snapshot)
+
     def test_合成传输默认关闭且与真实工具调用区分(self):
         from synthetic_wrapper import create_sandbox_spec, inject_express_gen_config
         request = models.OpenAIRequest(model="gemini-4-carbon", messages=[], stream=True)
@@ -211,6 +290,39 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[DONE]", output)
         self.cookie.execute_once.assert_awaited_once()
         self.request.app.state.express_key_manager = manager
+
+    async def test_短合成尾段及普通响应的结束帧顺序(self):
+        self.request_obj.stream = True
+        for synthetic, reason in ((True, None), (False, "MAX_TOKENS"), (False, None)):
+            with self.subTest(合成=synthetic, 结束原因=reason):
+                part = (api.types.Part(function_call=api.types.FunctionCall(
+                    name="compose_reply", args={"content": "短正文"}, will_continue=True)) if synthetic
+                    else api.types.Part(text="短正文"))
+                chunk = api.types.GenerateContentResponse(candidates=[api.types.Candidate(
+                    content=api.types.Content(role="model", parts=[part]), finish_reason=reason)])
+
+                async def body():
+                    yield chunk
+
+                generate = AsyncMock(return_value=body())
+                client = types.SimpleNamespace(aio=types.SimpleNamespace(models=types.SimpleNamespace(
+                    generate_content_stream=generate)))
+                context = {"prompt_func": lambda _: [], "request_obj": self.request_obj,
+                           "gen_config_dict": {}, "prefill_text": "",
+                           "synthetic_tool_name": "compose_reply" if synthetic else ""}
+                spec = {"client": client, "model_to_call": "local-model", "fallback_model": None,
+                        "fallback_client_factory": None}
+                with patch.object(self.express, "build_key_call_spec", return_value=spec), \
+                     patch.object(self.express, "prepare_express_context", return_value=(context, None)):
+                    response = await self.complete()
+                    frames = [frame async for frame in response.body_iterator]
+                deltas = [json.loads(frame[5:])["choices"][0] for frame in frames
+                          if frame.startswith("data:") and "[DONE]" not in frame]
+                reasons = [item["finish_reason"] for item in deltas if item["finish_reason"]]
+                self.assertEqual(reasons, ["length" if reason == "MAX_TOKENS" else "stop"])
+                self.assertEqual("".join(item["delta"].get("content", "") for item in deltas), "短正文")
+                self.assertIn("[DONE]", frames[-1])
+                generate.assert_awaited_once()
 
     async def test_SDK观测区分首块与有效内容且中断仍有汇总(self):
         self.request_obj.stream = True
